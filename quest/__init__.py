@@ -1,7 +1,7 @@
-from quest.models import LlamaForCausalLM
+from quest.models.llama import LlamaForCausalLM
 
 __version__ = "0.0.1"
 
 __all__ = [
-    "LlamaForCausalLM"
+    "LlamaForCausalLM",
 ]
