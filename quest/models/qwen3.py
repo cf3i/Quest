@@ -98,40 +98,52 @@ class Qwen3MLP(nn.Module):
     def forward(self, hidden_state):
         return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
-# --- 辅助函数：手动实现高精度 RoPE (修正版) ---
-def manual_rope_forward(q, k, seq_len_start, head_dim, theta, scale):
-    # q, k: [seq_len, heads, head_dim]
+# --- 辅助函数：优化版 RoPE ---
+# 使用 JIT 编译加速计算密集型操作
+@torch.jit.script
+def apply_rotary_pos_emb_jit(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    # x: [seq_len, num_heads, head_dim]
+    # cos, sin: [seq_len, 1, head_dim]
+    
+    # rotate_half
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    rotated = torch.cat((-x2, x1), dim=-1)
+    
+    return (x * cos) + (rotated * sin)
+
+def manual_rope_forward_optimized(q, k, seq_len_start, head_dim, theta: float, scale: float):
+    # q: [seq, 32, dim]
+    # k: [seq, 8, dim] (注意：这里允许 k 的头数比 q 少)
+    
     device = q.device
     seq_len = q.shape[0]
     
-    # 生成频率 (float32)
+    # 1. 生成频率 (只生成一次，广播给 Q 和 K)
+    # 强制 float32 防止溢出
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
     t = torch.arange(seq_len_start, seq_len_start + seq_len, device=device, dtype=torch.float32)
     freqs = torch.outer(t, inv_freq) # [seq, dim/2]
     
-    # 应用缩放
     if scale != 1.0:
         freqs = freqs * scale
         
     emb = torch.cat((freqs, freqs), dim=-1) # [seq, dim]
     
-    # [FIX] 增加 unsqueeze(1) 以便广播到 heads 维度
-    # emb: [seq, dim] -> [seq, 1, dim]
+    # [seq, dim] -> [seq, 1, dim] 方便广播
     cos = emb.cos().to(q.dtype).unsqueeze(1)
     sin = emb.sin().to(q.dtype).unsqueeze(1)
     
-    # 旋转辅助函数
-    def rotate_half(x):
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
-    # 现在形状匹配了：[seq, heads, dim] * [seq, 1, dim]
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    # 2. 分别应用 RoPE
+    # 此时 k 还是 8 个头，计算量小
+    q_embed = apply_rotary_pos_emb_jit(q, cos, sin)
+    k_embed = apply_rotary_pos_emb_jit(k, cos, sin)
+    
     return q_embed, k_embed
 
 class Qwen3QuestAttention(nn.Module):
+    # __init__ 部分保持不变 ... 
+    # (确保 q_norm, k_norm, rope_theta 等初始化逻辑和之前能跑通的代码一致)
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
@@ -143,11 +155,8 @@ class Qwen3QuestAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
-
-        # RoPE Theta (1,000,000)
         self.rope_theta = getattr(config, "rope_theta", 1000000.0)
         
-        # Bias: 严格遵循 Config (False)
         attention_bias = getattr(config, "attention_bias", False)
         
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=attention_bias)
@@ -155,14 +164,14 @@ class Qwen3QuestAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-        # Norm: 使用 PyTorch 原生 RMSNorm，防止 Quest Kernel 不兼容
-        # 必须开启！这是 nanovllm 验证过的。
+        # 强制开启 QK Norm
         self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         self._init_rope()
-
+    
     def _init_rope(self):
+        # 保持不变
         if self.config.rope_scaling is None:
             self.rope_scale = 1.0
         else:
@@ -188,6 +197,7 @@ class Qwen3QuestAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
         assert bsz == 1, "Batch size must be 1"
 
+        # 1. Proj
         torch.cuda.nvtx.range_push("qkv_proj")
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
@@ -195,26 +205,25 @@ class Qwen3QuestAttention(nn.Module):
         torch.cuda.nvtx.range_pop()
 
         # Reshape to NHD
+        # Q: [seq, 32, dim], K/V: [seq, 8, dim]
         query_states = query_states.view(q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(q_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(q_len, self.num_key_value_heads, self.head_dim)
         
-        # 1. QK Norm (PyTorch Native)
+        # 2. QK Norm (PyTorch Native)
+        # 注意：在 expand 之前做 Norm，计算量也是最小的
         torch.cuda.nvtx.range_push("qk_norm")
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
         torch.cuda.nvtx.range_pop()
 
-        # 2. GQA Expansion
-        if self.num_key_value_groups > 1:
-            key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1).contiguous()
-            value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1).contiguous()
-
-        # 3. RoPE (手动 Float32 计算，绕过 Quest Kernel)
-        # 这步是消除 "a a a" 的关键
+        # 3. RoPE (优化点：在 Expand 之前做！)
+        # 此时 key_states 只有 8 个头，计算量是之前的 1/4
         torch.cuda.nvtx.range_push("RoPE_Manual")
         start_pos = iController.kv_cache.seqlen - q_len
-        query_states, key_states = manual_rope_forward(
+        
+        # 使用优化后的 RoPE 函数
+        query_states, key_states = manual_rope_forward_optimized(
             query_states, 
             key_states, 
             start_pos, 
@@ -224,7 +233,14 @@ class Qwen3QuestAttention(nn.Module):
         )
         torch.cuda.nvtx.range_pop()
 
-        # 4. Quest Append KV
+        # 4. GQA Expansion (为了骗过 Quest Kernel)
+        # 这一步推迟到最后，减少中间内存占用
+        if self.num_key_value_groups > 1:
+            # Quest 必须看到 contiguous 的 32 头数据
+            key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1).contiguous()
+            value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1).contiguous()
+
+        # 5. Quest Append KV
         torch.cuda.nvtx.range_push("append_kv")
         quest.utils.append_kv(
             key_states,
@@ -234,19 +250,24 @@ class Qwen3QuestAttention(nn.Module):
         )
         torch.cuda.nvtx.range_pop()
 
-        # Prefill/Decode kernels
+        # ... (后续 Prefill/Decode 逻辑保持不变) ...
+        # ...
+        
         if q_len > 1:
-            torch.cuda.nvtx.range_push("prefill_attn")
-            attn_output = quest.utils.prefill_forward(query_states, iController, self.layer_idx)
-            torch.cuda.nvtx.range_pop()
+             # prefill logic...
+             torch.cuda.nvtx.range_push("prefill_attn")
+             attn_output = quest.utils.prefill_forward(query_states, iController, self.layer_idx)
+             torch.cuda.nvtx.range_pop()
         else:
-            if not iController.need_estimate():
+             # decode logic...
+             if not iController.need_estimate():
                 torch.cuda.nvtx.range_push("full_attn")
                 attn_output = quest.utils.decode_sparse_attn(
                     query_states, iController, self.layer_idx, iController.kv_indices_without_last
                 )
                 torch.cuda.nvtx.range_pop()
-            else:
+             else:
+                # estimate, topk, approx_attn ...
                 torch.cuda.nvtx.range_push("estimate")
                 estimated_attn_score = quest.utils.decode_estimate(query_states, iController, self.layer_idx)
                 torch.cuda.nvtx.range_pop()
@@ -260,14 +281,15 @@ class Qwen3QuestAttention(nn.Module):
                     query_states, iController, self.layer_idx, iController.topk_dindices_buffer
                 )
                 torch.cuda.nvtx.range_pop()
-
+        
         attn_output = attn_output.unsqueeze(0).reshape(bsz, q_len, self.hidden_size)
-
+        
         torch.cuda.nvtx.range_push("o_proj")
         attn_output = self.o_proj(attn_output)
         torch.cuda.nvtx.range_pop()
 
         return attn_output, None, past_key_value
+
 
 class Qwen3DecoderLayer(nn.Module):
     def __init__(self, config: Qwen3Config, layer_idx: int):
